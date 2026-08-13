@@ -6,6 +6,7 @@ Every endpoint that touches an order must call require_order_access first.
 from flask import Blueprint, abort, g, jsonify, request
 
 import orders
+import refunds
 
 bp = Blueprint("api", __name__)
 
@@ -47,3 +48,42 @@ def cancel_order(order_id):
         abort(409, description="order cannot be cancelled in its current state")
     orders.set_status(order_id, "cancelled")
     return jsonify({"id": order_id, "status": "cancelled"})
+
+
+@bp.post("/orders/<int:order_id>/refund")
+def refund_order(order_id):
+    payload = request.get_json(silent=True) or {}
+    amount = payload.get("amount")
+    if amount is None:
+        abort(400, description="amount is required")
+
+    require_order_access(order_id)
+
+    try:
+        refund = refunds.create_refund(order_id, amount, actor=g.current_user_id)
+    except ValueError as exc:
+        abort(409, description=str(exc))
+
+    return jsonify(
+        {
+            "refund_id": refund["id"],
+            "order_id": order_id,
+            "amount": refund["amount_cents"] / 100.0,
+        }
+    )
+
+
+@bp.get("/orders/<int:order_id>/refunds")
+def list_order_refunds(order_id):
+    order = require_order_access(order_id)
+    rows = refunds.find_refunds_for_order(order_id)
+    return jsonify(
+        [
+            {
+                "id": r["id"],
+                "amount": r["amount_cents"] / 100.0,
+                "refunded_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    )
