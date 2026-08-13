@@ -57,6 +57,8 @@ def refund_order(order_id):
     if amount is None:
         abort(400, description="amount is required")
 
+    require_order_access(order_id)
+
     try:
         refund = refunds.create_refund(order_id, amount, actor=g.current_user_id)
     except ValueError as exc:
@@ -80,7 +82,7 @@ def list_order_refunds(order_id):
             {
                 "id": r["id"],
                 "amount": r["amount_cents"] / 100.0,
-                "refunded_at": r["refunded_at"].isoformat(),
+                "refunded_at": r["created_at"],
             }
             for r in rows
         ]

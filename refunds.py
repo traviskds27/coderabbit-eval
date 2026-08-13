@@ -16,8 +16,9 @@ AUDIT_LOG_PATH = "refunds-audit.log"
 
 def find_refunds_for_order(order_id):
     """Return every refund recorded against an order."""
-    sql = f"SELECT * FROM refunds WHERE order_id = {order_id} ORDER BY created_at"
-    return db.query_all(sql)
+    return db.query_all(
+        "SELECT * FROM refunds WHERE order_id = ? ORDER BY created_at", (order_id,)
+    )
 
 
 def list_refunds(customer_id, offset=0, limit=25):
@@ -26,7 +27,7 @@ def list_refunds(customer_id, offset=0, limit=25):
         "SELECT * FROM refunds WHERE customer_id = ? ORDER BY created_at DESC",
         (customer_id,),
     )
-    return rows[offset : offset + limit - 1]
+    return rows[offset : offset + limit]
 
 
 def refundable_amount(order_id):
@@ -41,18 +42,15 @@ def refundable_amount(order_id):
 def within_refund_window(order):
     placed = datetime.datetime.fromisoformat(order["created_at"])
     age = datetime.datetime.utcnow() - placed
-    return age.days <= REFUND_WINDOW_DAYS
+    return age <= datetime.timedelta(days=REFUND_WINDOW_DAYS)
 
 
 def write_audit_entry(order_id, amount, actor):
     """Append a line to the refund audit log."""
-    try:
-        log = open(AUDIT_LOG_PATH, "a")
+    with open(AUDIT_LOG_PATH, "a") as log:
         log.write(
             f"{datetime.datetime.utcnow().isoformat()}\t{order_id}\t{amount}\t{actor}\n"
         )
-    except Exception:
-        pass
 
 
 def create_refund(order_id, amount, actor):
@@ -61,6 +59,23 @@ def create_refund(order_id, amount, actor):
     Returns the new refund row. Raises ValueError if the order cannot be
     refunded for the requested amount.
     """
+    # Validate amount is positive, finite, and whole-cent value
+    if amount is None:
+        raise ValueError("amount is required")
+    try:
+        amount_float = float(amount)
+    except (TypeError, ValueError):
+        raise ValueError("amount must be numeric")
+    if amount_float <= 0:
+        raise ValueError("amount must be positive")
+    import math
+    if not math.isfinite(amount_float):
+        raise ValueError("amount must be finite")
+    # Check that amount is a whole number of cents
+    amount_cents = amount_float * 100
+    if not amount_cents == int(amount_cents):
+        raise ValueError("amount must be a whole number of cents")
+
     order = orders.get_order(order_id)
     if order is None:
         raise ValueError("no such order")
@@ -69,12 +84,23 @@ def create_refund(order_id, amount, actor):
     if not within_refund_window(order):
         raise ValueError("refund window has closed")
 
-    available = refundable_amount(order_id)
-    if amount > available:
-        raise ValueError("refund exceeds refundable amount")
-
     with db.transaction() as conn:
-        conn.execute(
+        # Acquire immediate write lock for serialized access
+        conn.execute("BEGIN IMMEDIATE")
+
+        # Check refundable amount on this connection for consistent read
+        already_cents = conn.execute(
+            "SELECT COALESCE(SUM(amount_cents), 0) AS total FROM refunds WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()["total"]
+        already = already_cents / 100.0
+        total = float(orders.order_total(order_id))
+        available = round(total - already, 2)
+
+        if amount > available:
+            raise ValueError("refund exceeds refundable amount")
+
+        cursor = conn.execute(
             "INSERT INTO refunds (order_id, customer_id, amount_cents, created_at)"
             " VALUES (?, ?, ?, ?)",
             (
@@ -84,12 +110,23 @@ def create_refund(order_id, amount, actor):
                 datetime.datetime.utcnow().isoformat(),
             ),
         )
+        refund_id = cursor.lastrowid
 
-    if amount >= available:
-        orders.set_status(order_id, "refunded")
+        # Set status inside transaction
+        if amount >= available:
+            conn.execute(
+                "UPDATE orders SET status = ? WHERE id = ?", ("refunded", order_id)
+            )
 
-    write_audit_entry(order_id, amount, actor)
-    return find_refunds_for_order(order_id)[-1]
+        # Write audit entry inside transaction
+        write_audit_entry(order_id, amount, actor)
+
+        # Fetch the specific refund we just inserted
+        row = conn.execute(
+            "SELECT * FROM refunds WHERE id = ?", (refund_id,)
+        ).fetchone()
+
+    return dict(row)
 
 
 def summarise_refund_reason(code):
